@@ -49,3 +49,7 @@ python "loan default project.py"
 ## Dataset
 
 The dataset (`loan_data.xlsx`) contains borrower information and loan performance data. Features include credit history, loan characteristics, and demographic information.
+
+## Training Curves
+
+![Training and Validation Loss Curves](loss_curves.png)
