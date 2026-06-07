@@ -25,6 +25,10 @@ This project develops a binary classification model to predict whether a borrowe
 | Recall | 97.25% |
 | False Negative Rate | 2.75% |
 
+### Why Recall?
+
+In loan default prediction, missing a borrower who will default (false negative) is far more costly than flagging a good borrower as risky (false positive). **Recall** measures the proportion of actual defaults correctly identified, making it the primary metric. A 97.25% recall means the model captures nearly all defaulters, minimizing financial loss from bad loans.
+
 ## Dependencies
 
 - Python 3.11+
