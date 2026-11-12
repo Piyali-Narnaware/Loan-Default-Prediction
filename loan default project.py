@@ -123,7 +123,7 @@ neural_network.compile(
 neural_network.fit(
     X_train_ready,
     y_train.to_numpy(),
-    validation_data=(X_cal_ready, y_cal.to_numpy()),
+    validation_split=0.10,
     epochs=100,
     batch_size=64,
     class_weight=class_weights,
