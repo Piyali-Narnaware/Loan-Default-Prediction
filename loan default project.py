@@ -1,357 +1,253 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat May 30 16:47:52 2026
+"""Leakage-aware loan-default model comparison.
 
-@author: Piyali
+Run from the project folder with: python loan_default_comparison.py
+The test split is used only for final evaluation.
 """
-
-import pandas as pd
-import numpy as np
-import tensorflow as tf
-from sklearn.model_selection import train_test_split
-from imblearn.combine import SMOTEENN
-from tensorflow.keras.layers import Dense, Dropout, Normalization
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.regularizers import l2
-from collections import Counter
-from tensorflow.keras.optimizers.schedules import ExponentialDecay
-from tensorflow.keras.optimizers import Adam
-import random as python_random
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
 from pathlib import Path
-from sklearn.calibration import calibration_curve
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score,
-    brier_score_loss,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
+    accuracy_score, brier_score_loss, confusion_matrix, f1_score,
+    precision_score, recall_score, roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from tensorflow.keras import Sequential
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Dense, Dropout, Input
+from tensorflow.keras.regularizers import l2
+
+SEED = 42
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_PATH = PROJECT_DIR / "loan_data.xlsx"
+OUTPUT_DIR = PROJECT_DIR / "outputs"
+
+if not DATA_PATH.exists():
+    raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
+
+raw = pd.read_excel(DATA_PATH)
+if "loan_is_bad" not in raw.columns:
+    raise ValueError("Expected target column 'loan_is_bad' was not found.")
+
+target = raw["loan_is_bad"].astype(int)
+
+# Only variables available at loan origination are predictors. Payment,
+# recovery and collection fields are deliberately excluded to prevent leakage.
+numeric_features = [
+    "loan_amnt", "int_rate", "installment", "annual_inc", "emp_length",
+    "dti", "delinq_2yrs", "inq_last_6mths", "open_acc", "pub_rec",
+    "revol_bal", "revol_util", "total_acc",
+]
+categorical_features = [
+    "term", "sub_grade", "home_ownership", "verification_status", "purpose",
+]
+feature_names = numeric_features + categorical_features
+missing_columns = sorted(set(feature_names) - set(raw.columns))
+if missing_columns:
+    raise ValueError(f"Required predictor columns are missing: {missing_columns}")
+
+X = raw[feature_names].copy()
+for column in numeric_features:
+    X[column] = pd.to_numeric(X[column], errors="coerce")
+for column in categorical_features:
+    X[column] = X[column].astype("string").fillna("Missing").astype(str)
+
+# Fixed, stratified 70/10/10/10 split: model fitting, probability calibration,
+# threshold selection, and final testing use separate rows.
+X_train, X_remaining, y_train, y_remaining = train_test_split(
+    X, target, test_size=0.30, random_state=SEED, stratify=target
+)
+X_cal, X_remaining, y_cal, y_remaining = train_test_split(
+    X_remaining, y_remaining, test_size=2 / 3, random_state=SEED,
+    stratify=y_remaining,
+)
+X_validation, X_test, y_validation, y_test = train_test_split(
+    X_remaining, y_remaining, test_size=0.50, random_state=SEED,
+    stratify=y_remaining,
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("numeric", Pipeline([
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler()),
+        ]), numeric_features),
+        ("categorical", Pipeline([
+            ("impute", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), categorical_features),
+    ],
+    remainder="drop",
+    verbose_feature_names_out=False,
+)
+X_train_ready = preprocessor.fit_transform(X_train).astype("float32")
+X_cal_ready = preprocessor.transform(X_cal).astype("float32")
+X_validation_ready = preprocessor.transform(X_validation).astype("float32")
+X_test_ready = preprocessor.transform(X_test).astype("float32")
+
+# Both models use the same original training rows and balanced class weights.
+class_counts = np.bincount(y_train)
+class_weights = {
+    0: len(y_train) / (2 * class_counts[0]),
+    1: len(y_train) / (2 * class_counts[1]),
+}
+logistic = LogisticRegression(
+    max_iter=3000, class_weight="balanced", random_state=SEED
+)
+logistic.fit(X_train_ready, y_train)
+
+neural_network = Sequential([
+    Input(shape=(X_train_ready.shape[1],)),
+    Dense(30, activation="relu", kernel_regularizer=l2(0.001)),
+    Dropout(0.5),
+    Dense(30, activation="relu", kernel_regularizer=l2(0.001)),
+    Dropout(0.5),
+    Dense(15, activation="relu", kernel_regularizer=l2(0.001)),
+    Dense(15, activation="relu", kernel_regularizer=l2(0.001)),
+    Dense(1, activation="sigmoid"),
+])
+neural_network.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss="binary_crossentropy",
+)
+neural_network.fit(
+    X_train_ready,
+    y_train.to_numpy(),
+    validation_data=(X_cal_ready, y_cal.to_numpy()),
+    epochs=100,
+    batch_size=64,
+    class_weight=class_weights,
+    callbacks=[EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True)],
+    verbose=0,
 )
 
 
-# Set seed for reproducibility
-np.random.seed(42)
-python_random.seed(42)
-tf.random.set_seed(42)
+def calibrate_probabilities(raw_calibration, y_calibration, raw_values):
+    """Fit a sigmoid calibration map on the separate calibration split."""
+    epsilon = 1e-6
+    calibration_scores = np.clip(raw_calibration, epsilon, 1 - epsilon)
+    calibration_logits = np.log(calibration_scores / (1 - calibration_scores)).reshape(-1, 1)
+    values = np.clip(raw_values, epsilon, 1 - epsilon)
+    value_logits = np.log(values / (1 - values)).reshape(-1, 1)
+    calibrator = LogisticRegression(C=1e6, max_iter=1000, random_state=SEED)
+    calibrator.fit(calibration_logits, y_calibration)
+    return calibrator.predict_proba(value_logits)[:, 1]
 
-# Load data
-data = pd.read_excel('loan_data.xlsx')
 
-# Columns to drop are id, date (it does not help us understand anything)
-# Invoice column is being dropped too because it repeated. 
-# Some of the columns like total_credit_rv has more than 10k NAs, which will cause loss of data if it is kept and NA is dropped later on.
-columns_to_drop = [
-    'id', 'member_id', 'last_pymnt_d', 'last_credit_pull_d',
-    'mths_since_last_major_derog', 'mths_since_last_delinq', 'emp_title',
-    'tot_coll_amt', 'tot_cur_bal', 'mths_since_last_record', 'funded_amnt_inv',
-    'grade', 'pymnt_plan', 'desc', 'purpose', 'title', 'addr_state',
-    'total_pymnt_inv', 'collection_recovery_fee', 'next_pymnt_d',
-    'collections_12_mths_ex_med', 'policy_code', 'issue_d', 'earliest_cr_line',
-    'emp_length', 'recoveries', 'total_rec_late_fee', 'total_credit_rv',
-    'loan_status', 'verification_status'
-]
-
-# Drop the columns not useful for deep learning
-data_cleaned = data.drop(columns=columns_to_drop)
-
-# loan_is_bad, transform into numeric
-data_cleaned['loan_is_bad'] = data_cleaned['loan_is_bad'].apply(lambda x: 0 if x == 0 else 1)
-
-# Drop the xx behind the firdt three number so zip code can be use to train the model
-data_cleaned['zip_code'] = data_cleaned['zip_code'].str.extract(r'(\d+)').astype(int)
-
-# Transform different home_ownership into numeric using one_hot encoding, it is 0 if FALSE , 1 if TRUE
-data_cleaned = pd.get_dummies(data_cleaned, columns=['home_ownership'], prefix='home')
-
-# Nominal ordering for sub_grade. 
-sub_grade_mapping = {
-    "A1": 1, "A2": 2, "A3": 3, "A4": 4, "A5": 5,
-    "B1": 6, "B2": 7, "B3": 8, "B4": 9, "B5": 10,
-    "C1": 11, "C2": 12, "C3": 13, "C4": 14, "C5": 15,
-    "D1": 16, "D2": 17, "D3": 18, "D4": 19, "D5": 20,
-    "E1": 21, "E2": 22, "E3": 23, "E4": 24, "E5": 25,
-    "F1": 26, "F2": 27, "F3": 28, "F4": 29, "F5": 30,
-    "G1": 31, "G2": 32, "G3": 33, "G4": 34, "G5": 35
+raw_probabilities = {
+    "Logistic regression": {
+        "calibration": logistic.predict_proba(X_cal_ready)[:, 1],
+        "validation": logistic.predict_proba(X_validation_ready)[:, 1],
+        "test": logistic.predict_proba(X_test_ready)[:, 1],
+    },
+    "Neural network": {
+        "calibration": neural_network.predict(X_cal_ready, verbose=0).ravel(),
+        "validation": neural_network.predict(X_validation_ready, verbose=0).ravel(),
+        "test": neural_network.predict(X_test_ready, verbose=0).ravel(),
+    },
 }
-
-# Mapped the sub_grade numeric values into the column sub_grade
-data_cleaned['sub_grade'] = data_cleaned['sub_grade'].map(sub_grade_mapping)
-
-# Remove NAs in revol_util
-data_cleaned = data_cleaned.dropna(subset=['revol_util'])
-
-# Dropped the unwanted extra home_columns
-data_cleaned = data_cleaned.drop(['home_OTHER', 'home_NONE'], axis=1)
-
-# Converting TRUE to 1 and FALSE to 0. 
-data_cleaned['home_OWN'] = data_cleaned['home_OWN'].apply(lambda x: 0 if x == 0 else 1)
-
-data_cleaned['home_RENT'] = data_cleaned['home_RENT'].apply(lambda x: 0 if x == 0 else 1)
-
-data_cleaned['home_MORTGAGE'] = data_cleaned['home_MORTGAGE'].apply(lambda x: 0 if x == 0 else 1)
-
-# Prepare features and labels, features are the variables to train the model, labels are the outcome of loan_is_bad
-features = data_cleaned.drop(columns=['loan_is_bad']).values
-labels = data_cleaned['loan_is_bad'].values
-#print(features[0:20])
-#print(labels[0:20])
-
-# Since we need to use SMOTEENN, let's split using sklearn (could use TensorFlow but keeping as is for SMOTEENN compatibility)
-X_train, X_temp, y_train, y_temp = train_test_split(features, labels, test_size=0.2, random_state=42)
-
-# From the temporary dataset split half to test and another half to validation
-X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
-
-# Normalize features - TensorFlow's Normalization layer expects batches, so we normalize using sklearn here for simplicity
-# Normalize all features in X_train for SMOTEENN application
-normalizer = Normalization(axis=-1)  # Normalizes along the features axis
-normalizer.adapt(X_train)  # Adapt to the training data
-
-# Apply normalization to X_train and X_test, both training and testing variables (excluding outcome variable) needs to be normalised to reduce the range
-X_train_normalized = normalizer(X_train)
-X_test_normalized = normalizer(X_test)
-X_val_normalized = normalizer(X_val)
-
-# Apply SMOTEENN for both over-sampling and under-sampling on the scaled training data
-smote_enn = SMOTEENN(random_state=42)
-X_resampled, y_resampled = smote_enn.fit_resample(X_train_normalized, y_train) #bothsampling on the training set for both the features and the label
-
-# Convert the resampled data back into TensorFlow Datasets
-train_dataset = tf.data.Dataset.from_tensor_slices((X_resampled, y_resampled)).batch(64) 
-test_dataset = tf.data.Dataset.from_tensor_slices((X_test_normalized, y_test)).batch(64) # test set only normalised for the features and label remain unchanged
-val_dataset = tf.data.Dataset.from_tensor_slices((X_val_normalized, y_val)).batch(64)
-
-# Initial learning rate
-initial_learning_rate = 0.001
-
-# Define the learning rate schedule. Adjust the parameters as needed.
-lr_schedule = ExponentialDecay(
-    initial_learning_rate=initial_learning_rate,
-    decay_steps=1000,
-    decay_rate=0.96,
-    staircase=True)
-
-# Use the learning rate schedule in the optimizer.
-optimizer = Adam(learning_rate=lr_schedule) 
-
-# Model definition
-model = Sequential([
-    Dense(30, activation='relu', kernel_regularizer=l2(0.001), input_shape=(X_resampled.shape[1],)),
-    Dropout(0.5),
-    Dense(30, activation='relu', kernel_regularizer=l2(0.001)),
-    Dropout(0.5),
-    Dense(15, activation='relu', kernel_regularizer=l2(0.001)),
-    Dense(15, activation='relu', kernel_regularizer=l2(0.001)),
-    Dense(1, activation='sigmoid')
-])
-
-# Compile the model
-model.compile(optimizer=optimizer,
-              loss='binary_crossentropy',
-              metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), tf.keras.metrics.FalseNegatives()])
-
-# Train the model
-history = model.fit(train_dataset, epochs=100, validation_data = val_dataset) # the train_dataset contain x_resampled, and y_resampled namely the variables and outcome
-
-# Model evaluation
-evaluation = model.evaluate(test_dataset, verbose=2) 
-
-# Extract and print metrics
-accuracy, precision, recall, fn = evaluation[1], evaluation[2], evaluation[3], evaluation[4]
-print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, False Negatives: {fn}')
-
-# Plotting the training and validation loss curves
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Training and Validation Loss Curves')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.savefig('loss_curves.png', dpi=300, bbox_inches='tight')
-
-# Lower epoch higher false negative cases. 
-
-# Generate predictions for the confusion matrix and FNR calculation
-predictions = model.predict(X_test_normalized) # This code fundamentally use the trained model to make predictions on the normalised test dataset)
-predicted_classes = (predictions > 0.5).astype(int) # Converting the probabilities into class labels of 0 or 1. If probability > 0.5 then it is 1, 0 otherwise
-
-test_features, test_labels = next(iter(test_dataset))
-
-# Print out the predicted and the real values for comparison
-for pred, real in zip(predicted_classes, test_labels):
-    print(f"Predicted: {pred[0]};    Real: {real}")
-
-# Generate confusion matrix
-cm = confusion_matrix(y_test, predicted_classes) #Computes the confusion matrix using the actual result (y_test) and the predicted result from predicted_classes
-
-# Calculate True Positives (TP) and False Negatives (FN)
-TP = cm[1, 1] # true positive is at the 1st row and 1st column of cm 
-FN = cm[1, 0]
-
-# Calculate and print False Negative Rate (FNR)
-FNR = FN / (FN + TP) 
-print(f'False Negative Rate (Miss Rate): {FNR:.4f}')
+probabilities = {}
+for model_name, values in raw_probabilities.items():
+    probabilities[model_name] = {
+        split_name: calibrate_probabilities(
+            values["calibration"], y_cal, values[split_name]
+        )
+        for split_name in ("validation", "test")
+    }
 
 
-# DECISION-FOCUSED EVALUATION
-# Thresholds are selected on validation data. The test set is used only for final
-# evaluation. Relative false-negative/false-positive costs below are illustrative
-# scenarios, not observed lender losses or financial estimates.
-
-def classification_metrics(y_true, probabilities, threshold):
-    probabilities = np.asarray(probabilities).reshape(-1)
-    predictions = (probabilities >= threshold).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+def get_metrics(y_true, predicted_probabilities, threshold):
+    predicted = (predicted_probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, predicted, labels=[0, 1]).ravel()
     return {
         "threshold": float(threshold),
-        "accuracy": accuracy_score(y_true, predictions),
-        "precision": precision_score(y_true, predictions, zero_division=0),
-        "recall": recall_score(y_true, predictions, zero_division=0),
-        "f1": f1_score(y_true, predictions, zero_division=0),
-        "specificity": tn / (tn + fp) if (tn + fp) else np.nan,
-        "false_positive_rate": fp / (fp + tn) if (fp + tn) else np.nan,
-        "false_negative_rate": fn / (fn + tp) if (fn + tp) else np.nan,
+        "accuracy": accuracy_score(y_true, predicted),
+        "precision": precision_score(y_true, predicted, zero_division=0),
+        "recall": recall_score(y_true, predicted, zero_division=0),
+        "f1": f1_score(y_true, predicted, zero_division=0),
+        "specificity": tn / (tn + fp),
+        "roc_auc": roc_auc_score(y_true, predicted_probabilities),
+        "brier_score": brier_score_loss(y_true, predicted_probabilities),
         "true_negatives": int(tn),
         "false_positives": int(fp),
         "false_negatives": int(fn),
         "true_positives": int(tp),
-        "roc_auc": roc_auc_score(y_true, probabilities),
-        "brier_score": brier_score_loss(y_true, probabilities),
     }
 
 
-# Train an interpretable baseline on the original training rows.
-# The neural network above uses SMOTEENN; the logistic baseline uses class weights.
-X_train_array = np.asarray(X_train_normalized, dtype=np.float32)
-X_val_array = np.asarray(X_val_normalized, dtype=np.float32)
-X_test_array = np.asarray(X_test_normalized, dtype=np.float32)
-y_train_array = np.asarray(y_train).astype(int)
-y_val_array = np.asarray(y_val).astype(int)
-y_test_array = np.asarray(y_test).astype(int)
-
-logistic_model = LogisticRegression(
-    max_iter=2000,
-    class_weight="balanced",
-    random_state=42,
-)
-logistic_model.fit(X_train_array, y_train_array)
-
-model_probabilities = {
-    "Neural network": {
-        "validation": model.predict(X_val_array, verbose=0).reshape(-1),
-        "test": np.asarray(predictions).reshape(-1),
-    },
-    "Logistic regression": {
-        "validation": logistic_model.predict_proba(X_val_array)[:, 1],
-        "test": logistic_model.predict_proba(X_test_array)[:, 1],
-    },
-}
-
-# Compare both models at the default threshold on the untouched test set.
 comparison_rows = []
-for model_name, probability_sets in model_probabilities.items():
-    row = {"model": model_name, "evaluation": "test at 0.50 threshold"}
-    row.update(classification_metrics(y_test_array, probability_sets["test"], 0.50))
-    comparison_rows.append(row)
+scenario_rows = []
+threshold_grid = np.round(np.arange(0.05, 0.951, 0.01), 2)
+for model_name, splits in probabilities.items():
+    test_probabilities = splits["test"]
+    comparison_rows.append({
+        "model": model_name,
+        "evaluation": "held-out test at 0.50 threshold",
+        **get_metrics(y_test.to_numpy(), test_probabilities, 0.50),
+    })
 
-# Select each threshold using validation data only. Relative costs are scenario
-# inputs and must not be presented as actual portfolio loss estimates.
-threshold_rows = []
-candidate_thresholds = np.round(np.arange(0.05, 0.951, 0.01), 2)
-for model_name, probability_sets in model_probabilities.items():
-    validation_probabilities = probability_sets["validation"]
-    test_probabilities = probability_sets["test"]
+    # Relative error-cost ratios are user-selected scenarios, not measured
+    # financial losses or lending policy recommendations.
     for false_negative_cost in (5, 10, 20):
-        false_positive_cost = 1
-        validation_candidates = []
-        for threshold in candidate_thresholds:
-            val_metrics = classification_metrics(
-                y_val_array, validation_probabilities, threshold
+        validation_options = []
+        for threshold in threshold_grid:
+            validation_metrics = get_metrics(
+                y_validation.to_numpy(), splits["validation"], threshold
             )
-            scenario_cost = (
-                false_negative_cost * val_metrics["false_negatives"]
-                + false_positive_cost * val_metrics["false_positives"]
+            cost_units = (
+                false_negative_cost * validation_metrics["false_negatives"]
+                + validation_metrics["false_positives"]
             )
-            validation_candidates.append((scenario_cost, threshold, val_metrics))
-        best_validation_cost, selected_threshold, best_validation_metrics = min(
-            validation_candidates, key=lambda item: (item[0], item[1])
+            validation_options.append((cost_units, threshold))
+        validation_cost, selected_threshold = min(
+            validation_options, key=lambda option: (option[0], option[1])
         )
-
-        test_metrics = classification_metrics(
-            y_test_array, test_probabilities, selected_threshold
+        test_metrics = get_metrics(
+            y_test.to_numpy(), test_probabilities, selected_threshold
         )
-        test_scenario_cost = (
-            false_negative_cost * test_metrics["false_negatives"]
-            + false_positive_cost * test_metrics["false_positives"]
-        )
-        threshold_rows.append({
+        scenario_rows.append({
             "model": model_name,
-            "false_negative_to_false_positive_cost_ratio": (
-                f"{false_negative_cost}:1 illustrative"
+            "illustrative_FN_to_FP_cost_ratio": f"{false_negative_cost}:1",
+            "threshold_selected_on_validation": selected_threshold,
+            "validation_cost_units": int(validation_cost),
+            "test_cost_units": int(
+                false_negative_cost * test_metrics["false_negatives"]
+                + test_metrics["false_positives"]
             ),
-            "validation_selected_threshold": selected_threshold,
-            "validation_scenario_cost_units": int(best_validation_cost),
-            "validation_recall": best_validation_metrics["recall"],
-            "validation_precision": best_validation_metrics["precision"],
-            "test_scenario_cost_units": int(test_scenario_cost),
             **test_metrics,
         })
 
-# Export logistic-regression coefficients as directional, model-based explanations.
-# Coefficients are not causal effects or a substitute for a lending policy review.
-feature_names = data_cleaned.drop(columns=["loan_is_bad"]).columns
-coefficient_table = pd.DataFrame({
-    "feature": feature_names,
-    "coefficient": logistic_model.coef_[0],
-})
-coefficient_table["absolute_coefficient"] = coefficient_table["coefficient"].abs()
-coefficient_table = coefficient_table.sort_values(
-    "absolute_coefficient", ascending=False
-)
+OUTPUT_DIR.mkdir(exist_ok=True)
+comparison = pd.DataFrame(comparison_rows)
+scenarios = pd.DataFrame(scenario_rows)
+comparison.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False)
+scenarios.to_csv(OUTPUT_DIR / "threshold_scenarios.csv", index=False)
 
-# Produce quantile-bin calibration points for both models on the held-out test set.
-calibration_rows = []
-for model_name, probability_sets in model_probabilities.items():
-    observed_rate, mean_probability = calibration_curve(
-        y_test_array,
-        probability_sets["test"],
-        n_bins=10,
-        strategy="quantile",
-    )
-    for bin_number, (mean_predicted, observed) in enumerate(
-        zip(mean_probability, observed_rate), start=1
-    ):
-        calibration_rows.append({
-            "model": model_name,
-            "quantile_bin": bin_number,
-            "mean_predicted_probability": float(mean_predicted),
-            "observed_default_rate": float(observed),
-        })
-
-output_directory = Path("outputs")
-output_directory.mkdir(parents=True, exist_ok=True)
-pd.DataFrame(comparison_rows).to_csv(
-    output_directory / "model_comparison.csv", index=False
+print(f"Rows: {len(raw):,}; default rate: {target.mean():.4%}")
+print(
+    f"Split: train {len(y_train):,}; calibration {len(y_cal):,}; "
+    f"threshold validation {len(y_validation):,}; test {len(y_test):,}"
 )
-pd.DataFrame(threshold_rows).to_csv(
-    output_directory / "threshold_cost_scenarios.csv", index=False
-)
-coefficient_table.to_csv(
-    output_directory / "logistic_regression_coefficients.csv", index=False
-)
-pd.DataFrame(calibration_rows).to_csv(
-    output_directory / "calibration_bins.csv", index=False
-)
-
-print("\nDecision-focused evaluation")
-print("Models: neural network and class-weighted logistic regression")
-print("Thresholds selected on validation data; final metrics use the held-out test set")
-print("False-negative cost ratios are illustrative scenario assumptions only")
-print(pd.DataFrame(comparison_rows)[
-    ["model", "accuracy", "precision", "recall", "f1", "roc_auc", "brier_score"]
-].to_string(index=False))
-print(f"Analysis outputs saved in: {output_directory.resolve()}")
-
+print(f"Encoded features: {X_train_ready.shape[1]}")
+print("\nHeld-out test metrics at threshold 0.50")
+print(comparison[[
+    "model", "accuracy", "precision", "recall", "f1", "roc_auc", "brier_score",
+    "true_negatives", "false_positives", "false_negatives", "true_positives",
+]].to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+print("\nThreshold scenarios; cost ratios are illustrative assumptions")
+print(scenarios[[
+    "model", "illustrative_FN_to_FP_cost_ratio",
+    "threshold_selected_on_validation", "precision", "recall",
+    "false_negatives", "false_positives", "test_cost_units",
+]].to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+print(f"\nSaved outputs to {OUTPUT_DIR}")
