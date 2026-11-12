@@ -1,112 +1,65 @@
-# Loan Default Prediction
+# Loan Default Model Comparison
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange)
-![scikit-learn](https://img.shields.io/badge/scikit--learn-1.3-green)
+A reproducible analysis of 50,000 historical loan records. It compares a class-weighted logistic regression with a small neural network, then examines how decision thresholds change false negatives and false positives.
 
-A loan-default classification project that evaluates a recall-focused neural network and compares its decision behaviour with a logistic-regression baseline. The current neural-network result is **97.25% recall** at a 0.50 threshold. The extended workflow also examines threshold trade-offs, illustrative error-cost scenarios and probability calibration.
+## What the analysis uses
 
----
+The target is `loan_is_bad`. The 18 predictors are application or origination fields: requested loan amount, interest rate, instalment, income, employment length, debt-to-income ratio, credit-history indicators, account counts, revolving balance and utilisation, term, sub-grade, home ownership, verification status and loan purpose.
 
-## Why Recall Matters
+Payment amounts, payment dates, recoveries, collections and other post-origination fields are excluded. Those fields can reveal how a loan performed and would leak outcome information into a model intended to assess risk at application time. The earlier 97.25% recall headline came from a pipeline that included post-origination payment fields; it should not be presented as a valid application-time result.
 
-False negatives and false positives have different consequences. This project reports both types of error and examines how threshold choices change their balance. The relative costs used in scenario analysis are explicitly illustrative, not measured lender losses.
+The records cover May 2012 to February 2013. The analysis uses a stratified random split, so the results are a model comparison on this dataset, not a time-forward validation or evidence of performance on today's lending population.
 
-| Metric | Value |
-|--------|-------|
-| Accuracy | 93.10% |
-| Precision | 69.66% |
-| **Recall** | **97.25%** |
-| False Negative Rate | 2.75% |
+## Method
 
----
+1. Split records into training, calibration, threshold-validation and test sets at 70%, 10%, 10% and 10%, stratified by outcome.
+2. Impute missing numeric values with training medians, standardise them, impute missing categories and one-hot encode them. Fit preprocessing on the training set only.
+3. Fit logistic regression and a four-layer neural network on the same training observations, using balanced class weights.
+4. Calibrate each model's probabilities on a separate calibration split.
+5. Select decision thresholds on the threshold-validation split under illustrative false-negative:false-positive count-cost ratios of 5:1, 10:1 and 20:1.
+6. Report final metrics on the untouched test split.
 
-## Architecture
+The ratios are scenario assumptions, not observed financial losses, lender-approved costs or lending-policy recommendations. The project does not implement or evaluate a real lending strategy.
 
-```
-┌─────────────┐     ┌──────────────┐     ┌──────────────────┐     ┌──────────┐
-│  Loan Data  │────▶│  SMOTEENN   │────▶│  Neural Network  │────▶│  Predict │
-│  (Excel)    │     │  Resampling │     │  4 Dense Layers  │     │  Default │
-└─────────────┘     └──────────────┘     │  30-30-15-15     │     └──────────┘
-                                          │  + Dropout 50%   │
-                                          │  + L2 Regularise │
-                                          │  + Exp LR Decay  │
-                                          └──────────────────┘
-```
+## Results from the checked run
 
-### Model Specs
+The overall default rate was 15.63%. The test set contained 5,000 records, including 781 defaults. Both models had modest ranking performance and were close to each other.
 
-| Layer | Neurons | Activation | Regularisation |
-|-------|---------|------------|----------------|
-| Dense 1 | 30 | ReLU | L2 + Dropout 50% |
-| Dense 2 | 30 | ReLU | L2 + Dropout 50% |
-| Dense 3 | 15 | ReLU | L2 + Dropout 50% |
-| Dense 4 | 15 | ReLU | L2 + Dropout 50% |
-| Output | 1 | Sigmoid | — |
+| Model | Test ROC AUC | Test Brier score | Test result at 0.50 threshold |
+|---|---:|---:|---|
+| Logistic regression | 0.6623 | 0.1259 | Predicted no defaults; 0% recall |
+| Neural network | 0.6563 | 0.1266 | Predicted no defaults; 0% recall |
 
-### Training Curve
+A constant prediction equal to the test default rate has a Brier score of about 0.1318. Both calibrated models improve on that benchmark slightly, but their ROC AUC shows limited ability to rank loans by default risk. A 0.50 threshold is therefore not useful here; changing the threshold trades false negatives against false positives.
 
-![Loss Curves](loss_curves.png)
+Thresholds were chosen on validation data and then evaluated once on the test data. The cost values below are weighted error counts, not money.
 
----
+| Model | Assumed FN:FP ratio | Validation-selected threshold | Test recall | Test precision | Test false negatives | Test false positives | Test weighted error count |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Logistic regression | 5:1 | 0.17 | 57.62% | 23.96% | 331 | 1,428 | 3,083 |
+| Neural network | 5:1 | 0.17 | 57.62% | 24.32% | 331 | 1,400 | 3,055 |
+| Logistic regression | 10:1 | 0.11 | 85.53% | 18.81% | 113 | 2,883 | 4,013 |
+| Neural network | 10:1 | 0.09 | 92.32% | 17.52% | 60 | 3,395 | 3,995 |
+| Logistic regression | 20:1 | 0.05 | 98.72% | 16.10% | 10 | 4,017 | 4,217 |
+| Neural network | 20:1 | 0.07 | 98.08% | 16.53% | 15 | 3,868 | 4,168 |
 
-## Key Features
+The lower thresholds catch more defaults but flag many non-default loans. The neural network does not consistently outperform logistic regression. No threshold in this exercise should be treated as an actual lending rule.
 
-- **Class Imbalance Handling** — SMOTEENN (SMOTE + Edited Nearest Neighbours) oversamples minority class and cleans noisy samples
-- **Regularisation Stack** — L2 weight decay + 50% dropout + exponential learning rate decay prevent overfitting
-- **Decision-threshold analysis** — Thresholds selected on validation data and assessed on a separate test set
-- **Reproducible Pipeline** — Single Python script with fixed random seeds
+## Run the project
 
----
-
-## Decision-focused evaluation
-
-The training script now compares the neural network with a class-weighted logistic-regression baseline. The neural network uses SMOTEENN on the training split; the baseline uses class weights on the original training rows.
-
-Thresholds from 0.05 to 0.95 are evaluated on validation data. For each model, the script selects thresholds under illustrative false-negative to false-positive cost ratios of 5:1, 10:1 and 20:1, then reports the selected threshold's performance on the held-out test data. These cost units are scenario assumptions, not actual financial losses or lending-policy recommendations.
-
-The script also reports ROC AUC and Brier score, exports calibration-bin comparisons, and saves logistic-regression coefficients as directional model explanations. Coefficients describe model associations and are not causal effects.
-
-Running the script creates:
-
-- `outputs/model_comparison.csv` — test-set metrics at the 0.50 threshold
-- `outputs/threshold_cost_scenarios.csv` — validation-selected thresholds and test-set results by illustrative cost ratio
-- `outputs/logistic_regression_coefficients.csv` — signed logistic-regression coefficients
-- `outputs/calibration_bins.csv` — mean predicted probability and observed default rate by quantile bin
-
-The project analyses a historical dataset. It does not monitor a live lending portfolio, implement a credit policy, measure actual customer outcomes or establish regulatory compliance.
-
-## Project Structure
-
-```
-├── loan default project.py   # Training and decision-analysis pipeline
-├── loan_data.xlsx            # Input dataset
-├── loss_curves.png           # Training/validation loss plot
-├── outputs/                  # Generated evaluation tables
-└── README.md
-```
-
----
-
-## Installation & Usage
+Place `loan_data.xlsx` beside the script, then run:
 
 ```bash
-git clone https://github.com/Piyali-Narnaware/Loan-Default-Prediction.git
-cd Loan-Default-Prediction
-pip install tensorflow scikit-learn imbalanced-learn pandas numpy matplotlib openpyxl
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install "numpy==1.26.4" "pandas==2.2.3" "scikit-learn==1.6.1" "tensorflow-cpu==2.16.2" openpyxl
+python loan_default_comparison.py
 ```
 
-Run the full pipeline:
+On Windows, activate the environment with `.venv\\Scripts\\activate`.
 
-```bash
-python "loan default project.py"
-```
+The script writes `outputs/model_comparison.csv` and `outputs/threshold_scenarios.csv`.
 
----
+## Limits
 
-## Dependencies
-
-- Python 3.11+
-- TensorFlow / Keras
-- scikit-learn, imbalanced-learn
-- pandas, numpy, matplotlib, openpyxl
+This is a historical portfolio-data exercise with a random holdout from the same short period. It is not a production credit model, does not establish fairness or regulatory compliance, and does not demonstrate professional lending-strategy ownership. The results should be explained with these limits in view.
