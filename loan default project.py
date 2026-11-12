@@ -19,6 +19,18 @@ from tensorflow.keras.optimizers import Adam
 import random as python_random
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
+from pathlib import Path
+from sklearn.calibration import calibration_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+
 
 # Set seed for reproducibility
 np.random.seed(42)
@@ -182,4 +194,164 @@ FN = cm[1, 0]
 # Calculate and print False Negative Rate (FNR)
 FNR = FN / (FN + TP) 
 print(f'False Negative Rate (Miss Rate): {FNR:.4f}')
+
+
+# DECISION-FOCUSED EVALUATION
+# Thresholds are selected on validation data. The test set is used only for final
+# evaluation. Relative false-negative/false-positive costs below are illustrative
+# scenarios, not observed lender losses or financial estimates.
+
+def classification_metrics(y_true, probabilities, threshold):
+    probabilities = np.asarray(probabilities).reshape(-1)
+    predictions = (probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+    return {
+        "threshold": float(threshold),
+        "accuracy": accuracy_score(y_true, predictions),
+        "precision": precision_score(y_true, predictions, zero_division=0),
+        "recall": recall_score(y_true, predictions, zero_division=0),
+        "f1": f1_score(y_true, predictions, zero_division=0),
+        "specificity": tn / (tn + fp) if (tn + fp) else np.nan,
+        "false_positive_rate": fp / (fp + tn) if (fp + tn) else np.nan,
+        "false_negative_rate": fn / (fn + tp) if (fn + tp) else np.nan,
+        "true_negatives": int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "true_positives": int(tp),
+        "roc_auc": roc_auc_score(y_true, probabilities),
+        "brier_score": brier_score_loss(y_true, probabilities),
+    }
+
+
+# Train an interpretable baseline on the original training rows.
+# The neural network above uses SMOTEENN; the logistic baseline uses class weights.
+X_train_array = np.asarray(X_train_normalized, dtype=np.float32)
+X_val_array = np.asarray(X_val_normalized, dtype=np.float32)
+X_test_array = np.asarray(X_test_normalized, dtype=np.float32)
+y_train_array = np.asarray(y_train).astype(int)
+y_val_array = np.asarray(y_val).astype(int)
+y_test_array = np.asarray(y_test).astype(int)
+
+logistic_model = LogisticRegression(
+    max_iter=2000,
+    class_weight="balanced",
+    random_state=42,
+)
+logistic_model.fit(X_train_array, y_train_array)
+
+model_probabilities = {
+    "Neural network": {
+        "validation": model.predict(X_val_array, verbose=0).reshape(-1),
+        "test": np.asarray(predictions).reshape(-1),
+    },
+    "Logistic regression": {
+        "validation": logistic_model.predict_proba(X_val_array)[:, 1],
+        "test": logistic_model.predict_proba(X_test_array)[:, 1],
+    },
+}
+
+# Compare both models at the default threshold on the untouched test set.
+comparison_rows = []
+for model_name, probability_sets in model_probabilities.items():
+    row = {"model": model_name, "evaluation": "test at 0.50 threshold"}
+    row.update(classification_metrics(y_test_array, probability_sets["test"], 0.50))
+    comparison_rows.append(row)
+
+# Select each threshold using validation data only. Relative costs are scenario
+# inputs and must not be presented as actual portfolio loss estimates.
+threshold_rows = []
+candidate_thresholds = np.round(np.arange(0.05, 0.951, 0.01), 2)
+for model_name, probability_sets in model_probabilities.items():
+    validation_probabilities = probability_sets["validation"]
+    test_probabilities = probability_sets["test"]
+    for false_negative_cost in (5, 10, 20):
+        false_positive_cost = 1
+        validation_candidates = []
+        for threshold in candidate_thresholds:
+            val_metrics = classification_metrics(
+                y_val_array, validation_probabilities, threshold
+            )
+            scenario_cost = (
+                false_negative_cost * val_metrics["false_negatives"]
+                + false_positive_cost * val_metrics["false_positives"]
+            )
+            validation_candidates.append((scenario_cost, threshold, val_metrics))
+        best_validation_cost, selected_threshold, best_validation_metrics = min(
+            validation_candidates, key=lambda item: (item[0], item[1])
+        )
+
+        test_metrics = classification_metrics(
+            y_test_array, test_probabilities, selected_threshold
+        )
+        test_scenario_cost = (
+            false_negative_cost * test_metrics["false_negatives"]
+            + false_positive_cost * test_metrics["false_positives"]
+        )
+        threshold_rows.append({
+            "model": model_name,
+            "false_negative_to_false_positive_cost_ratio": (
+                f"{false_negative_cost}:1 illustrative"
+            ),
+            "validation_selected_threshold": selected_threshold,
+            "validation_scenario_cost_units": int(best_validation_cost),
+            "validation_recall": best_validation_metrics["recall"],
+            "validation_precision": best_validation_metrics["precision"],
+            "test_scenario_cost_units": int(test_scenario_cost),
+            **test_metrics,
+        })
+
+# Export logistic-regression coefficients as directional, model-based explanations.
+# Coefficients are not causal effects or a substitute for a lending policy review.
+feature_names = data_cleaned.drop(columns=["loan_is_bad"]).columns
+coefficient_table = pd.DataFrame({
+    "feature": feature_names,
+    "coefficient": logistic_model.coef_[0],
+})
+coefficient_table["absolute_coefficient"] = coefficient_table["coefficient"].abs()
+coefficient_table = coefficient_table.sort_values(
+    "absolute_coefficient", ascending=False
+)
+
+# Produce quantile-bin calibration points for both models on the held-out test set.
+calibration_rows = []
+for model_name, probability_sets in model_probabilities.items():
+    observed_rate, mean_probability = calibration_curve(
+        y_test_array,
+        probability_sets["test"],
+        n_bins=10,
+        strategy="quantile",
+    )
+    for bin_number, (mean_predicted, observed) in enumerate(
+        zip(mean_probability, observed_rate), start=1
+    ):
+        calibration_rows.append({
+            "model": model_name,
+            "quantile_bin": bin_number,
+            "mean_predicted_probability": float(mean_predicted),
+            "observed_default_rate": float(observed),
+        })
+
+output_directory = Path("outputs")
+output_directory.mkdir(parents=True, exist_ok=True)
+pd.DataFrame(comparison_rows).to_csv(
+    output_directory / "model_comparison.csv", index=False
+)
+pd.DataFrame(threshold_rows).to_csv(
+    output_directory / "threshold_cost_scenarios.csv", index=False
+)
+coefficient_table.to_csv(
+    output_directory / "logistic_regression_coefficients.csv", index=False
+)
+pd.DataFrame(calibration_rows).to_csv(
+    output_directory / "calibration_bins.csv", index=False
+)
+
+print("\nDecision-focused evaluation")
+print("Models: neural network and class-weighted logistic regression")
+print("Thresholds selected on validation data; final metrics use the held-out test set")
+print("False-negative cost ratios are illustrative scenario assumptions only")
+print(pd.DataFrame(comparison_rows)[
+    ["model", "accuracy", "precision", "recall", "f1", "roc_auc", "brier_score"]
+].to_string(index=False))
+print(f"Analysis outputs saved in: {output_directory.resolve()}")
 
