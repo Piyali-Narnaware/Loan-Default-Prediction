@@ -1,6 +1,6 @@
 """Leakage-aware loan-default model comparison.
 
-Run from the project folder with: python loan_default_comparison.py
+Run from the project folder with: python "loan default project.py"
 The test split is used only for final evaluation.
 """
 from pathlib import Path
