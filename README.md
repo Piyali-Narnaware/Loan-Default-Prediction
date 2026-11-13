@@ -2,6 +2,10 @@
 
 A reproducible analysis of 50,000 historical loan records. It compares a class-weighted logistic regression with a small neural network, then examines how decision thresholds change false negatives and false positives.
 
+## Decision question
+
+Can application-time information distinguish higher-risk loans, and what happens to false positives when the threshold is lowered to capture more defaults? This is a comparison of methods, not a proposed lending policy.
+
 ## What the analysis uses
 
 The target is `loan_is_bad`. The 18 predictors are application or origination fields: requested loan amount, interest rate, instalment, income, employment length, debt-to-income ratio, credit-history indicators, account counts, revolving balance and utilisation, term, sub-grade, home ownership, verification status and loan purpose.
@@ -21,7 +25,7 @@ The records cover May 2012 to February 2013. The analysis uses a stratified rand
 
 The ratios are scenario assumptions, not observed financial losses, lender-approved costs or lending-policy recommendations. The project does not implement or evaluate a real lending strategy.
 
-## Results from the checked run
+## Results from the documented run
 
 The overall default rate was 15.63%. The test set contained 5,000 records, including 781 defaults. Both models had modest ranking performance and were close to each other.
 
@@ -45,6 +49,10 @@ Thresholds were chosen on validation data and then evaluated once on the test da
 
 The lower thresholds catch more defaults but flag many non-default loans. The neural network does not consistently outperform logistic regression. No threshold in this exercise should be treated as an actual lending rule.
 
+## Interpretation for a risk analyst
+
+The model ranking is modest (ROC AUC around 0.66), and the 0.50 threshold misses all defaults in this test. Lower thresholds improve recall but flag many borrowers who did not default. This makes the trade-off visible; it does not make the model suitable for deployment. A time-based holdout, stability testing, fairness assessment and realistic financial cost estimates would be needed before any operational use.
+
 ## Run the project
 
 Place `loan_data.xlsx` beside the script, then run:
@@ -59,6 +67,10 @@ python "loan default project.py"
 On Windows, activate the environment with `.venv\\Scripts\\activate`.
 
 The script writes `outputs/model_comparison.csv` and `outputs/threshold_scenarios.csv`.
+
+## Reproducibility status
+
+The repository has a Python syntax check in GitHub Actions. The full training pipeline and published numeric results have **not** been independently reproduced by that check; run the script and compare the output CSVs before treating them as newly verified.
 
 ## Limits
 
