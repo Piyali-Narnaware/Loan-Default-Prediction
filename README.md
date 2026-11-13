@@ -4,7 +4,7 @@ A reproducible analysis of 50,000 historical loan records. It compares a class-w
 
 ## Decision question
 
-Can application-time information distinguish higher-risk loans, and what happens to false positives when the threshold is lowered to capture more defaults? This is a comparison of methods, not a proposed lending policy.
+Can application-time information distinguish higher-risk loans, and what happens to false positives when the threshold is lowered to capture more defaults? The point is to compare methods and understand their errors, not to propose a lending policy.
 
 ## What the analysis uses
 
